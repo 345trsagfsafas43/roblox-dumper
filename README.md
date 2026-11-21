@@ -5,10 +5,10 @@ A Roblox client dumper with improved capture completeness, output reliability, a
 ## Run
 
 ```lua
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua?cache=' .. tostring(os.time())))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v8/dumper.lua'))()
 ```
 
-RightShift toggles the menu. Choose the capture options, then press **Start dump**.
+This loader uses the verified v8 release. RightShift toggles the menu. Choose the capture options, then press **Start dump**.
 
 For a run without the menu:
 
@@ -20,7 +20,7 @@ getgenv().DumperConfig = {
     Output = "Split files",
     MaxFileMB = 24,
 }
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua?cache=' .. tostring(os.time())))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v8/dumper.lua'))()
 ```
 
 ## Output
