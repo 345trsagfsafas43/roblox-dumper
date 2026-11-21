@@ -1,0 +1,121 @@
+return function(harness)
+    harness.test("yielding module inspection times out and continues", function()
+        local api, mock = harness.make({ Config = { Modules = true, ModuleTimeout = 0.1 } })
+        local module = mock.instance("ModuleScript", "Waiting", mock.services.ReplicatedStorage)
+        api.Has.loadedmodules = true
+        mock.env.getloadedmodules = function() return { module } end
+        mock.env.require = function() while true do mock.task.wait() end end
+        local ok, result = api.Dump.run()
+        harness.equal(ok, true)
+        harness.contains(mock.files[result.output], "timed out after 0.1s")
+        harness.equal(api.Dump.pendingWorker, nil)
+    end)
+    harness.test("run saves complete snapshot and returns real paths", function()
+        local api, mock = harness.make()
+        mock.instance("LocalScript", "Example", mock.services.ReplicatedStorage).source = "return 12\n"
+        local ok, result = api.Dump.run()
+        harness.equal(ok, true)
+        harness.equal(result.complete, true)
+        harness.equal(result.output, "Dumper/123/Dump.txt")
+        harness.contains(mock.files[result.output], "return 12")
+        harness.contains(mock.files[result.manifest], "COMPLETE")
+        harness.equal(api.Dump.running, false)
+    end)
+    harness.test("failed output does not claim success and permits rerun", function()
+        local api, mock = harness.make()
+        mock.failWrite = "Dumper/123/Dump.txt"
+        local ok, result = api.Dump.run()
+        harness.equal(ok, false)
+        harness.equal(result.output, nil)
+        harness.contains(result.message, "writing failed")
+        harness.equal(api.Dump.running, false)
+        mock.failWrite = nil
+        harness.equal(api.Dump.run(), true)
+    end)
+    harness.test("setup failure releases running flag", function()
+        local api, mock = harness.make()
+        mock.failIsfolder = true
+        local ok, result = api.Dump.run()
+        harness.equal(ok, false)
+        harness.contains(result.message, "errored")
+        harness.equal(api.Dump.running, false)
+        harness.equal(api.Session.running, false)
+        mock.failIsfolder = nil
+        harness.equal(api.Dump.run(), true)
+    end)
+    harness.test("config edits during a run apply next run", function()
+        local api, mock = harness.make()
+        local script = mock.instance("LocalScript", "Snapshot", mock.services.ReplicatedStorage)
+        script.source = "return 'kept'\n"
+        local original = mock.env.decompile
+        mock.env.decompile = function(inst)
+            api.UserConfig.Scripts = false
+            api.UserConfig.Tree = false
+            return original(inst)
+        end
+        harness.equal(api.Dump.run(), true)
+        harness.contains(mock.files[api.Dump.lastOutput], "return 'kept'")
+        harness.contains(mock.files[api.Dump.lastOutput], "INSTANCE TREE")
+        harness.equal(api.Dump.run(), true)
+        assert(not mock.files[api.Dump.lastOutput]:find("SCRIPTS", 1, true), "next run ignored option edit")
+    end)
+    harness.test("stop produces explicit partial manifest", function()
+        local api, mock = harness.make()
+        mock.instance("LocalScript", "Cancel", mock.services.ReplicatedStorage)
+        mock.env.decompile = function()
+            api.Dump.cancel = true
+            return "return 1\n"
+        end
+        local ok, result = api.Dump.run()
+        harness.equal(ok, true)
+        harness.equal(result.complete, false)
+        harness.contains(result.message, "stopped early")
+        harness.contains(mock.files[result.manifest], "PARTIAL")
+    end)
+    harness.test("recorder always stops after active options change", function()
+        local api, mock = harness.make({ Config = { Spy = true, SpySeconds = 0 } })
+        local remote = mock.instance("RemoteEvent", "Seen", mock.services.ReplicatedStorage)
+        mock.instance("LocalScript", "Mutate", mock.services.ReplicatedStorage)
+        mock.env.decompile = function()
+            api.UserConfig.Spy = false
+            return "return 1\n"
+        end
+        harness.equal(api.Dump.run(), true)
+        harness.equal(api.Spy.active, false)
+        harness.equal(#api.Spy.connections, 0)
+        harness.equal(remote.OnClientEvent.connections[1].Connected, false)
+    end)
+    harness.test("reload waits for old session without competing writer", function()
+        local api, mock = harness.make()
+        api.Session.running = true
+        api.Dump.running = true
+        mock.boot()
+        harness.equal(mock.sharedEnv.Dumper.Run, api.Dump.run)
+        harness.equal(api.Dump.cancel, true)
+        harness.contains(mock.warnings[1], "previous dump is still finishing")
+    end)
+    harness.test("unfinished worker blocks starting another dump", function()
+        local api = harness.make()
+        api.Dump.pendingWorker = coroutine.create(function() end)
+        local ok, message = api.Dump.run()
+        harness.equal(ok, false)
+        harness.contains(message, "unfinished worker")
+        harness.equal(api.Session.busy(), true)
+    end)
+    harness.test("invalid config is bounded and roots validated", function()
+        local api = harness.make({ Config = { SpySeconds = math.huge, MaxDepth = "oops",
+            MaxFileMB = -7, Scripts = "yes", Roots = { "ReplicatedStorage", "bad", "ReplicatedStorage" } } })
+        harness.equal(api.Config.SpySeconds, 20)
+        harness.equal(api.Config.MaxDepth, 40)
+        harness.equal(api.Config.MaxFileMB, 0)
+        harness.equal(api.Config.Scripts, true)
+        harness.equal(#api.Config.Roots, 1)
+    end)
+    harness.test("failed UI download keeps callable headless API", function()
+        local api, mock = harness.make({ Config = { NoUI = false } })
+        mock.boot()
+        harness.contains(mock.warnings[1], "Menu unavailable")
+        harness.equal(type(mock.sharedEnv.Dumper.Run), "function")
+        harness.equal(mock.sharedEnv.Dumper.Run(), true)
+    end)
+end
