@@ -5,7 +5,7 @@ A Roblox client dumper with improved capture completeness, output reliability, a
 ## Run
 
 ```lua
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua'))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua?cache=' .. tostring(os.time())))()
 ```
 
 RightShift toggles the menu. Choose the capture options, then press **Start dump**.
@@ -20,7 +20,7 @@ getgenv().DumperConfig = {
     Output = "Split files",
     MaxFileMB = 24,
 }
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua'))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/main/dumper.lua?cache=' .. tostring(os.time())))()
 ```
 
 ## Output
