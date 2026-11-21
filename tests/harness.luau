@@ -25,7 +25,7 @@ function harness.make(options)
         Info = false, Scripts = true, Tree = true, Remotes = true, Listeners = false,
         Signals = false, Tags = false, Globals = false, Modules = false, Values = true,
         Interactables = false, UiText = false, Hidden = false, Attributes = true,
-        Spy = false, HideName = false, NoUI = true, AutoStart = false,
+        Spy = false, HideName = false, NoUI = true, AutoStart = false, Assets = false,
         Roots = { "ReplicatedStorage" }, OnlyMyCharacter = false,
     }
     for key, value in pairs(options.Config or {}) do config[key] = value end
@@ -156,7 +156,7 @@ function harness.make(options)
     for key, value in pairs(options.globals or {}) do e[key] = value end
     local exports = [[
 return {
-    Config = Config, UserConfig = UserConfig, Dump = Dump, Has = Has, Spy = Spy, Session = Session,
+    Config = Config, UserConfig = UserConfig, Dump = Dump, Has = Has, Spy = Spy, Session = Session, Host = Host,
     Buffer = Buffer, fmt = fmt, serialize = serialize, indexSiblings = indexSiblings,
     segment = segment, pathOf = pathOf, parentPathOf = parentPathOf, loadSuspects = loadSuspects,
     State = State, newContext = newContext, childFrames = childFrames, visit = visit,
@@ -164,6 +164,8 @@ return {
     isDefaultScript = isDefaultScript, writeAll = writeAll, writeChunks = writeChunks,
     writeOutputs = writeOutputs, writeIndex = writeIndex, filePath = filePath,
     normaliseConfig = normaliseConfig,
+    utf8Prefix = utf8Prefix, Budget = Budget, collectAssets = collectAssets, writeAssets = writeAssets,
+    capabilityReport = capabilityReport, writeInfo = writeInfo,
     SetConfig = function(changes) for key, value in pairs(changes) do Config[key] = value end end,
 }
 ]]
@@ -182,5 +184,8 @@ end
 require("../tests/core-cases")(harness)
 require("../tests/output-cases")(harness)
 require("../tests/lifecycle-cases")(harness)
+require("../tests/export-cases")(harness)
+require("../tests/core-v9-cases")(harness)
+require("../tests/asset-host-cases")(harness)
 print(("RESULT %d passed, %d failed"):format(harness.passed, harness.failed))
 assert(harness.failed == 0, "regression suite failed")

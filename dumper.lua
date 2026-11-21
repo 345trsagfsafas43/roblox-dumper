@@ -4,7 +4,12 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
-local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local scriptGlobals = getfenv(1)
+local env = _G
+if typeof(getgenv) == "function" then
+    local okEnv, candidate = pcall(getgenv)
+    if okEnv and typeof(candidate) == "table" then env = candidate end
+end
 
 local previous = env.__DumperSession
 if typeof(previous) == "table" and typeof(previous.stop) == "function" then
@@ -21,34 +26,52 @@ if typeof(env.__DumperUnload) == "function" then pcall(env.__DumperUnload) end
 local function has(fn) return typeof(fn) == "function" end
 local dbg = typeof(debug) == "table" and debug or {}
 
+local HOST_ALIASES = {
+    getscriptbytecode = { "dumpstring" },
+    getscriptclosure = { "getscriptfunction" },
+    identifyexecutor = { "getexecutorname" },
+}
+local function resolveHost(name)
+    local candidates = { name }
+    for _, alias in ipairs(HOST_ALIASES[name] or {}) do candidates[#candidates + 1] = alias end
+    for _, key in ipairs(candidates) do
+        local okGlobal, global = pcall(function() return scriptGlobals[key] end)
+        if okGlobal and has(global) then return global, key end
+        local value = rawget(env, key)
+        if has(value) then return value, key end
+    end
+    return nil
+end
+local Host: any = setmetatable({}, { __index = function(_, name) return resolveHost(name) end })
+
 local Has = {
-    writefile = has(writefile),
-    appendfile = has(appendfile),
-    readfile = has(readfile),
-    makefolder = has(makefolder),
-    isfolder = has(isfolder),
-    isfile = has(isfile),
-    delfile = has(delfile),
-    decompile = has(decompile),
-    scripthash = has(getscripthash),
-    bytecode = has(getscriptbytecode),
-    scriptclosure = has(getscriptclosure) or has(getscriptfunction),
-    constants = has(dbg.getconstants) or has(getconstants),
-    protos = has(dbg.getprotos) or has(getprotos),
-    nilinstances = has(getnilinstances),
-    loadedmodules = has(getloadedmodules),
-    runningscripts = has(getrunningscripts),
-    connections = has(getconnections),
+    writefile = has(Host.writefile),
+    appendfile = has(Host.appendfile),
+    readfile = has(Host.readfile),
+    makefolder = has(Host.makefolder),
+    isfolder = has(Host.isfolder),
+    isfile = has(Host.isfile),
+    delfile = has(Host.delfile),
+    decompile = has(Host.decompile),
+    scripthash = has(Host.getscripthash),
+    bytecode = has(Host.getscriptbytecode),
+    scriptclosure = has(Host.getscriptclosure),
+    constants = has(dbg.getconstants) or has(Host.getconstants),
+    protos = has(dbg.getprotos) or has(Host.getprotos),
+    nilinstances = has(Host.getnilinstances),
+    loadedmodules = has(Host.getloadedmodules),
+    runningscripts = has(Host.getrunningscripts),
+    connections = has(Host.getconnections),
     info = has(dbg.info),
-    callbackvalue = has(getcallbackvalue),
-    renv = has(getrenv),
+    callbackvalue = has(Host.getcallbackvalue),
+    renv = has(Host.getrenv),
     hook = has(hookmetamethod) and has(getnamecallmethod),
     checkcaller = has(checkcaller),
     callingscript = has(getcallingscript),
-    clipboard = has(setclipboard),
+    clipboard = has(Host.setclipboard),
 }
 
-local VERSION = "Dumper v8"
+local VERSION = "Dumper v9"
 local WIDTH = 80
 local RULE = string.rep("=", WIDTH)
 local THIN = string.rep("-", WIDTH)
@@ -77,6 +100,8 @@ local Config = {
     Tags = true,
     Globals = true,
     Modules = false,
+    Assets = true,
+    ExportScripts = false,
     Values = true,
     Interactables = true,
     UiText = true,
@@ -97,6 +122,9 @@ local Config = {
     MaxScriptChars = 500000,
     DecompileTimeout = 10,
     ModuleTimeout = 10,
+    MaxDedupeMB = 8,
+    MaxAssets = 10000,
+    AssetSamples = 8,
     Roots = { "Workspace", "ReplicatedStorage", "ReplicatedFirst", "StarterGui", "StarterPlayer",
         "StarterPack", "Players", "Lighting", "SoundService", "Teams" },
     AutoStart = false,
@@ -125,6 +153,7 @@ local function normaliseConfig(input)
         SpySeconds = { 0, 3600 }, MaxFileMB = { 0, 1024 }, MaxDepth = { 1, 200 },
         MaxScriptChars = { 1000, 10000000 }, DecompileTimeout = { 0.1, 120 },
         ModuleTimeout = { 0.1, 120 },
+        MaxDedupeMB = { 0, 512 }, MaxAssets = { 1, 100000 }, AssetSamples = { 1, 64 },
     }
     for key, bound in pairs(bounds) do
         local value = tonumber(input[key])
@@ -134,6 +163,8 @@ local function normaliseConfig(input)
     end
     result.MaxDepth = math.floor(result.MaxDepth)
     result.MaxScriptChars = math.floor(result.MaxScriptChars)
+    result.MaxAssets = math.floor(result.MaxAssets)
+    result.AssetSamples = math.floor(result.AssetSamples)
     if result.MaxFileMB > 0 then result.MaxFileMB = math.max(1 / 1024, result.MaxFileMB) end
     result.Roots = {}
     local wanted = {}
@@ -173,6 +204,20 @@ local function fmt(n)
     return ("%.17g"):format(n)
 end
 
+local function utf8Prefix(text: string, limit: number): string
+    local cut = math.clamp(math.floor(limit), 0, #text)
+    if cut < #text then
+        local nextByte = text:byte(cut + 1)
+        while cut > 0 and nextByte and nextByte >= 128 and nextByte < 192 do
+            cut = cut - 1
+            nextByte = text:byte(cut + 1)
+        end
+    end
+    return text:sub(1, cut)
+end
+
+local safePath: (any) -> string
+
 local function serialize(value, depth, state)
     depth = depth or 0
     state = state or { seen = {}, nodes = 0 }
@@ -180,15 +225,14 @@ local function serialize(value, depth, state)
     if state.nodes > 120 then return "<value limit>" end
     local kind = typeof(value)
     if kind == "string" then
-        if #value > 200 then value = value:sub(1, 200) .. ("... [%d bytes total]"):format(#value) end
+        if #value > 200 then value = utf8Prefix(value, 200) .. ("... [%d bytes total]"):format(#value) end
         return (("%q"):format(value):gsub("\\\n", "\\n"):gsub("\r", "\\r"))
     elseif kind == "number" then
         return fmt(value)
     elseif kind == "boolean" or kind == "nil" then
         return tostring(value)
     elseif kind == "Instance" then
-        local ok, name = pcall(value.GetFullName, value)
-        return "<" .. (ok and name or "?") .. ">"
+        return "<" .. safePath(value) .. ">"
     elseif kind == "Vector3" then
         return ("Vector3(%s, %s, %s)"):format(fmt(value.X), fmt(value.Y), fmt(value.Z))
     elseif kind == "Vector2" then
@@ -242,7 +286,7 @@ local function inlineAttributes(list)
     local parts = {}
     for i, attr in ipairs(list) do parts[i] = attr.key .. "=" .. attr.text end
     local text = table.concat(parts, ", ")
-    if #text > 300 then text = text:sub(1, 300) .. "..." end
+    if #text > 300 then text = utf8Prefix(text, 300) .. "..." end
     return text
 end
 
@@ -282,13 +326,23 @@ local function escapeSegment(name)
     end))
 end
 
-local function indexSiblings(parent, children)
+local Budget: any, Dump: any
+
+local function indexSiblings(parent, children, cooperative)
     local counts, seen, map = {}, {}, {}
-    for _, child in ipairs(children) do
+    for i, child in ipairs(children) do
+        if cooperative and i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         local name = child.Name
         counts[name] = (counts[name] or 0) + 1
     end
-    for _, child in ipairs(children) do
+    for i, child in ipairs(children) do
+        if cooperative and i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         local name = child.Name
         if counts[name] > 1 then
             seen[name] = (seen[name] or 0) + 1
@@ -330,7 +384,7 @@ local function pathOf(inst)
     return table.concat(parts, ".")
 end
 
-local function safePath(inst)
+safePath = function(inst)
     local ok, path = pcall(pathOf, inst)
     return ok and path or tostring(inst)
 end
@@ -408,12 +462,12 @@ local function ensureFolder()
     for _, path in ipairs({ "Dumper", folder() }) do
         local exists = false
         if Has.isfolder then
-            local ok, result = pcall(isfolder, path)
+            local ok, result = pcall(Host.isfolder, path)
             if not ok then error("isfolder failed for " .. path .. ": " .. tostring(result), 0) end
             exists = result == true
         end
         if not exists then
-            local ok, result = pcall(makefolder, path)
+            local ok, result = pcall(Host.makefolder, path)
             if not ok or result == false then error("makefolder failed for " .. path .. ": " .. tostring(result), 0) end
         end
     end
@@ -441,10 +495,10 @@ end
 
 local function writeAll(path: string, chunks: {string})
     if Has.appendfile then
-        checkedFileCall("writefile", writefile, path, chunks[1] or "")
-        for i = 2, #chunks do checkedFileCall("appendfile", appendfile, path, chunks[i]) end
+        checkedFileCall("writefile", Host.writefile, path, chunks[1] or "")
+        for i = 2, #chunks do checkedFileCall("appendfile", Host.appendfile, path, chunks[i]) end
     else
-        checkedFileCall("writefile", writefile, path, table.concat(chunks))
+        checkedFileCall("writefile", Host.writefile, path, table.concat(chunks))
     end
 end
 local function partPath(path: string, n: number): string
@@ -512,14 +566,68 @@ local function writeChunks(path: string, chunks: {string})
         local n = part
         while true do
             local stalePath = partPath(path, n)
-            local ok, exists = pcall(isfile, stalePath)
+            local ok, exists = pcall(Host.isfile, stalePath)
             if not ok then error("isfile failed for " .. stalePath .. ": " .. tostring(exists), 0) end
             if exists ~= true then break end
-            checkedFileCall("delfile", delfile, stalePath)
+            checkedFileCall("delfile", Host.delfile, stalePath)
             n = n + 1
         end
     end
     return #metadata, metadata
+end
+
+local function scriptExportPath(row, ordinal)
+    local label = row.path:match("([^%.]+)$") or row.path
+    label = anonymise(label)
+    local stem = label:gsub("[^A-Za-z0-9_%-]", "_"):sub(1, 72)
+    if stem == "" then stem = "script" end
+    local extension = row.status == "constants" and ".constants.txt" or ".lua"
+    local name = ("%06d_%s%s"):format(ordinal, stem, extension)
+    return Has.makefolder and (folder() .. "/Scripts/" .. name)
+        or ("Dumper_%d_Script_%s"):format(game.PlaceId, name)
+end
+
+local function writeScriptExports(ctx: any, onYield)
+    local exports = ctx.scriptExports
+    if not Config.ExportScripts then return end
+    local needsFolder = false
+    for _, row in ipairs(ctx.index) do
+        if typeof(row.exportSource) == "string" then needsFolder = true; break end
+    end
+    if needsFolder and Has.makefolder then
+        local directory = folder() .. "/Scripts"
+        local exists = false
+        if Has.isfolder then
+            local ok, result = pcall(Host.isfolder, directory)
+            if not ok then error("isfolder failed for " .. directory .. ": " .. tostring(result), 0) end
+            exists = result == true
+        end
+        if not exists then
+            local ok, result = pcall(Host.makefolder, directory)
+            if not ok or result == false then error("makefolder failed for " .. directory .. ": " .. tostring(result), 0) end
+        end
+    end
+    local byPath = {}
+    for ordinal, row in ipairs(ctx.index) do
+        local source = row.exportSource
+        if typeof(source) == "string" and (row.status == "ok" or row.status == "constants" or row.status == "truncated") then
+            local path = scriptExportPath(row, ordinal)
+            writeAll(path, { source })
+            row.exportFile, row.exportBytes = path, #source
+            row.exportSource = nil
+            exports[#exports + 1] = {
+                path = path, scriptPath = row.path, bytes = #source, className = row.className,
+                status = row.status, truncated = row.truncated == true or row.status == "truncated",
+            }
+            byPath[row.path] = row
+        end
+        if onYield then onYield() end
+    end
+    for _, row in ipairs(ctx.index) do
+        local original = row.status == "same" and byPath[row.sameAs]
+        if original then row.exportFile, row.exportBytes = original.exportFile, original.exportBytes end
+    end
+    ctx.stats.scriptFiles = #exports
 end
 
 local function encodeStateName(name)
@@ -532,15 +640,22 @@ local function decodeStateName(name)
     return (name:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
 end
 
-local function loadSuspects(path)
+local function loadSuspects(path, status: any?)
     local suspects = {}
+    local stateStatus: any = status or {}
+    stateStatus.writable = false
     if not Has.readfile then return suspects end
     if Has.isfile then
-        local okFile, exists = pcall(isfile, path)
-        if okFile and not exists then return suspects end
+        local okFile, exists = pcall(Host.isfile, path)
+        if not okFile then error("crash-state isfile failed for " .. path .. ": " .. tostring(exists), 0) end
+        if exists == false then stateStatus.writable = true; return suspects end
+        if exists ~= true then error("crash-state isfile returned an invalid result for " .. path, 0) end
     end
-    local ok, content = pcall(readfile, path)
-    if not ok or typeof(content) ~= "string" then return suspects end
+    local ok, content = pcall(Host.readfile, path)
+    if not ok or typeof(content) ~= "string" then
+        if not Has.isfile then return suspects end
+        error("crash-state read failed for " .. path .. ": " .. tostring(content), 0)
+    end
     local pending, lastAttempt, hasDone = {}, nil, false
     local version2 = content:match("^FORMAT\t2[\r\n]") ~= nil
     for line in content:gmatch("[^\r\n]+") do
@@ -561,6 +676,7 @@ local function loadSuspects(path)
     elseif lastAttempt then
         suspects[lastAttempt] = true
     end
+    stateStatus.writable = true
     return suspects
 end
 
@@ -572,19 +688,19 @@ function State.open(path, suspects)
     for name in pairs(suspects) do names[#names + 1] = name end
     table.sort(names)
     for _, name in ipairs(names) do State.text[#State.text + 1] = "SUSPECT\t" .. encodeStateName(name) .. "\n" end
-    local ok, err = pcall(writefile, path, table.concat(State.text))
-    if not ok then error("crash-state write failed for " .. path .. ": " .. tostring(err), 0) end
+    local ok, err = pcall(Host.writefile, path, table.concat(State.text))
+    if not ok or err == false then error("crash-state write failed for " .. path .. ": " .. tostring(err), 0) end
 end
 
 function State.add(line)
     State.text[#State.text + 1] = line
     local ok, err
     if Has.appendfile then
-        ok, err = pcall(appendfile, State.path, line)
+        ok, err = pcall(Host.appendfile, State.path, line)
     else
-        ok, err = pcall(writefile, State.path, table.concat(State.text))
+        ok, err = pcall(Host.writefile, State.path, table.concat(State.text))
     end
-    if not ok then error("crash-state write failed for " .. State.path .. ": " .. tostring(err), 0) end
+    if not ok or err == false then error("crash-state write failed for " .. State.path .. ": " .. tostring(err), 0) end
 end
 
 function State.record(tag, name)
@@ -719,7 +835,7 @@ function Spy.write(out)
     end
 end
 
-local Dump = { running = false, cancel = false }
+Dump = { running = false, cancel = false }
 
 local function isDefaultScript(inst)
     local current = inst
@@ -750,7 +866,7 @@ local function decompileWithTimeout(inst)
     local started = os.clock()
     local worker
     worker = task.spawn(function()
-        ok, result = pcall(decompile, inst)
+        ok, result = pcall(Host.decompile, inst)
         done = true
         if Dump.pendingWorker == worker then Dump.pendingWorker = nil end
     end)
@@ -777,9 +893,9 @@ end
 
 local function constantsOf(inst)
     if not Has.scriptclosure or not Has.constants then return nil end
-    local getClosure = has(getscriptclosure) and getscriptclosure or getscriptfunction
-    local getConstants = has(dbg.getconstants) and dbg.getconstants or getconstants
-    local getProtos = Has.protos and (has(dbg.getprotos) and dbg.getprotos or getprotos) or nil
+    local getClosure = Host.getscriptclosure
+    local getConstants = has(dbg.getconstants) and dbg.getconstants or Host.getconstants
+    local getProtos = Has.protos and (has(dbg.getprotos) and dbg.getprotos or Host.getprotos) or nil
     local ok, closure = pcall(getClosure, inst)
     if not ok or type(closure) ~= "function" then return nil end
     local seen, seenFns, list, visited, bytes = {}, {}, {}, 0, 0
@@ -789,13 +905,16 @@ local function constantsOf(inst)
         visited = visited + 1
         local okC, consts = pcall(getConstants, fn)
         if okC and type(consts) == "table" then
+            local inspected = 0
             for _, value in pairs(consts) do
+                inspected = inspected + 1
+                if inspected % 128 == 0 then Budget.check() end
                 if #list >= 800 or bytes >= 256 * 1024 or Dump.cancel then break end
                 if type(value) == "string" and #value > 0 and not seen[value] then
-                    seen[value] = true
-                    local text = #value > 4096 and (value:sub(1, 4096) .. ("... [%d bytes total]"):format(#value)) or value
+                    if #value <= 4096 then seen[value] = true end
+                    local text = #value > 4096 and (utf8Prefix(value, 4096) .. ("... [%d bytes total]"):format(#value)) or value
                     local remaining = 256 * 1024 - bytes
-                    if #text > remaining then text = text:sub(1, remaining) end
+                    if #text > remaining then text = utf8Prefix(text, remaining) end
                     bytes = bytes + #text
                     list[#list + 1] = text
                 end
@@ -804,7 +923,10 @@ local function constantsOf(inst)
         if getProtos then
             local okP, protos = pcall(getProtos, fn)
             if okP and type(protos) == "table" then
+                local inspected = 0
                 for _, proto in pairs(protos) do
+                    inspected = inspected + 1
+                    if inspected % 128 == 0 then Budget.check() end
                     if visited >= 600 or #list >= 800 or bytes >= 256 * 1024 or Dump.cancel then break end
                     if type(proto) == "function" then walk(proto, depth + 1) end
                 end
@@ -817,7 +939,7 @@ local function constantsOf(inst)
     return list
 end
 
-local function newContext()
+local function newContext(): any
     local characters = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player.Character then characters[player.Character] = player end
@@ -828,7 +950,8 @@ local function newContext()
             failures = 0, constants = 0, suspects = 0, remotes = 0, values = 0, interactables = 0,
             collapsed = 0, hidden = 0, tags = 0, texts = 0, remotesLeftOut = 0,
             depthLimited = 0,
-            truncated = 0, cancelled = 0,
+            truncated = 0, cancelled = 0, dedupeLimited = 0, unstableIdentities = 0,
+            assets = 0, assetUses = 0, assetOverflow = 0,
         },
         myPath = pathOf(LocalPlayer) .. ".",
         timings = {},
@@ -843,6 +966,9 @@ local function newContext()
         hidden = {},
         index = {},
         seenScripts = {},
+        dedupeBytes = 0,
+        assets = {},
+        assetOrder = {},
         out = {
             Tree = Buffer.new(),
             Values = Buffer.new(),
@@ -851,7 +977,7 @@ local function newContext()
     }
 end
 
-local Budget = { last = 0 }
+Budget = { last = 0 }
 
 function Budget.start() Budget.last = os.clock() end
 
@@ -863,6 +989,76 @@ function Budget.check(onYield)
     end
 end
 
+local ASSET_PROPERTIES = {
+    MeshPart = { "MeshId", "TextureID" }, SpecialMesh = { "MeshId", "TextureId" },
+    Decal = { { "ColorMapContent", "TextureContent", "Texture" } },
+    Texture = { { "ColorMapContent", "TextureContent", "Texture" } },
+    ImageLabel = { "Image" }, ImageButton = { "Image", "HoverImage", "PressedImage" },
+    Sound = { "SoundId" }, Animation = { "AnimationId" },
+    ParticleEmitter = { "Texture" }, Beam = { "Texture" }, Trail = { "Texture" },
+    SurfaceAppearance = { { "ColorMapContent", "ColorMap" }, { "MetalnessMapContent", "MetalnessMap" },
+        { "NormalMapContent", "NormalMap" }, { "RoughnessMapContent", "RoughnessMap" } },
+    MaterialVariant = { { "ColorMapContent", "ColorMap" }, { "MetalnessMapContent", "MetalnessMap" },
+        { "NormalMapContent", "NormalMap" }, { "RoughnessMapContent", "RoughnessMap" } },
+    VideoFrame = { "Video" },
+    Sky = { "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp", "SunTextureId", "MoonTextureId" },
+    Shirt = { "ShirtTemplate" }, Pants = { "PantsTemplate" }, ShirtGraphic = { "Graphic" },
+}
+local function readProperty(inst, property) return inst[property] end
+local function collectAssets(ctx: any, inst, className, path)
+    local properties = ASSET_PROPERTIES[className]
+    if not properties then return end
+    ctx.assets, ctx.assetOrder = ctx.assets or {}, ctx.assetOrder or {}
+    for _, choices in ipairs(properties) do
+        local value, property
+        for _, candidate in ipairs(typeof(choices) == "table" and choices or { choices }) do
+            local ok, found = pcall(readProperty, inst, candidate)
+            if ok and typeof(found) == "Content" then
+                local okUri, uri = pcall(readProperty, found, "Uri")
+                found = okUri and uri or nil
+            end
+            if ok and typeof(found) == "string" and found ~= "" then
+                value, property = found, candidate
+                break
+            end
+        end
+        if value then
+            if #value > 2048 then
+                ctx.stats.assetOverflow = (ctx.stats.assetOverflow or 0) + 1
+                continue
+            end
+            local lower = value:lower()
+            local id = lower:match("^rbxassetid://(%d+)$")
+            local assetUrl = lower:match("^https?://www%.roblox%.com/asset/?%?")
+                or lower:match("^https?://assetdelivery%.roblox%.com/v1/asset/?%?")
+            if not id and assetUrl then
+                id = lower:match("[?&]id=(%d+)$") or lower:match("[?&]id=(%d+)[&#]")
+            end
+            if id then
+                id = id:gsub("^0+", "")
+                if id == "" then continue end
+            end
+            local key = id and ("id:" .. id) or ("uri:" .. value)
+            local entry = ctx.assets[key]
+            if not entry then
+                if #ctx.assetOrder >= Config.MaxAssets then
+                    ctx.stats.assetOverflow = (ctx.stats.assetOverflow or 0) + 1
+                    continue
+                end
+                entry = { key = key, id = id, uri = value, uses = 0, references = {} }
+                ctx.assets[key] = entry
+                ctx.assetOrder[#ctx.assetOrder + 1] = entry
+                ctx.stats.assets = (ctx.stats.assets or 0) + 1
+            end
+            entry.uses = entry.uses + 1
+            ctx.stats.assetUses = (ctx.stats.assetUses or 0) + 1
+            if #entry.references < Config.AssetSamples then
+                entry.references[#entry.references + 1] = { path = path, className = className, property = property }
+            end
+        end
+    end
+end
+
 local function treeNote(className, value, hasValue)
     if REMOTE_CLASSES[className] then return "  <- remote" end
     if className == "Script" then return nil end
@@ -871,16 +1067,22 @@ local function treeNote(className, value, hasValue)
 end
 
 local function childFrames(ctx, inst, depth, prefix, parentPath, inGui, suppressTree)
+    if Dump.cancel then return nil end
     local ok, children = pcall(inst.GetChildren, inst)
     if not ok or #children == 0 then return nil end
     if depth > Config.MaxDepth then
         ctx.stats.depthLimited = ctx.stats.depthLimited + #children
         return nil
     end
-    local map = indexSiblings(inst, children)
+    local map = indexSiblings(inst, children, true)
+    if not map or Dump.cancel then return nil end
 
     local groups, kept = {}, {}
-    for _, child in ipairs(children) do
+    for i, child in ipairs(children) do
+        if i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         local name, className = child.Name, child.ClassName
         if className ~= "Terrain" then
             local owner = className == "Model" and Config.OnlyMyCharacter and ctx.characters[child]
@@ -914,7 +1116,13 @@ local function childFrames(ctx, inst, depth, prefix, parentPath, inGui, suppress
         end
     end
 
+    local groupNumber = 0
     for _, group in pairs(groups) do
+        groupNumber = groupNumber + 1
+        if groupNumber % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         local extra = group.count - 3
         if extra > 0 and group.last and Config.CollapseRepeats
             and not REMOTE_CLASSES[group.className] and not SCRIPT_CLASSES[group.className]
@@ -926,14 +1134,28 @@ local function childFrames(ctx, inst, depth, prefix, parentPath, inGui, suppress
     end
 
     local frames = {}
-    for _, item in ipairs(kept) do
+    for i, item in ipairs(kept) do
+        if i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         frames[#frames + 1] = item
         if item.fold then frames[#frames + 1] = { note = item.fold, suppressTree = suppressTree } end
     end
     local count = 0
-    for _, frame in ipairs(frames) do if not frame.suppressTree then count = count + 1 end end
+    for i, frame in ipairs(frames) do
+        if i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
+        if not frame.suppressTree then count = count + 1 end
+    end
     local visible = 0
-    for _, frame in ipairs(frames) do
+    for i, frame in ipairs(frames) do
+        if i % 128 == 0 then
+            Budget.check()
+            if Dump.cancel then return nil end
+        end
         if not frame.suppressTree then visible = visible + 1 end
         frame.depth, frame.prefix, frame.isLast = depth, prefix, visible == count
     end
@@ -947,11 +1169,12 @@ local function noteText(ctx, inst, className, path)
     if not ok or type(text) ~= "string" then return end
     text = text:gsub("<[^>]->", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     if text == "" or #ctx.texts >= 3000 then return end
-    ctx.texts[#ctx.texts + 1] = { kind = kind, text = #text > 120 and (text:sub(1, 120) .. "...") or text, path = path }
+    ctx.texts[#ctx.texts + 1] = { kind = kind, text = #text > 120 and (utf8Prefix(text, 120) .. "...") or text, path = path }
     ctx.stats.texts = ctx.stats.texts + 1
 end
 
 local function visit(ctx, frame)
+    if Dump.cancel then return end
     local out, stats = ctx.out, ctx.stats
     local branch = frame.depth == 0 and "" or (frame.isLast and "`-- " or "|-- ")
 
@@ -967,6 +1190,7 @@ local function visit(ctx, frame)
     ctx.visited[inst] = true
     stats.instances = stats.instances + 1
     ctx.classCount[className] = (ctx.classCount[className] or 0) + 1
+    if Config.Assets then collectAssets(ctx, inst, className, path) end
 
     local attrs = Config.Attributes and readAttributes(inst) or nil
     local tags = Config.Tags and readTags(inst) or nil
@@ -1040,15 +1264,21 @@ local function visit(ctx, frame)
     local children = childFrames(ctx, inst, frame.depth + 1, childPrefix, path, frame.inGui, frame.suppressTree)
     if children then
         local stack = ctx.stack
-        for i = #children, 1, -1 do stack[#stack + 1] = children[i] end
+        for i = #children, 1, -1 do
+            if i % 128 == 0 then
+                Budget.check()
+                if Dump.cancel then return end
+            end
+            stack[#stack + 1] = children[i]
+        end
     end
 end
 
 local function collectHidden(ctx)
     local sources = {
-        { "nil parented", Has.nilinstances and getnilinstances },
-        { "loaded module", Has.loadedmodules and getloadedmodules },
-        { "running script", Has.runningscripts and getrunningscripts },
+        { "nil parented", Has.nilinstances and Host.getnilinstances },
+        { "loaded module", Has.loadedmodules and Host.getloadedmodules },
+        { "running script", Has.runningscripts and Host.getrunningscripts },
     }
     for _, source in ipairs(sources) do
         local label, getter = source[1], source[2]
@@ -1081,6 +1311,35 @@ local function collectHidden(ctx)
     end
 end
 
+local function unstablePath(path: string): boolean
+    if path:sub(1, 4) == "nil." then return true end
+    local at = 1
+    while at <= #path do
+        local char = path:sub(at, at)
+        if char == "\\" then at = at + 2
+        else
+            if char == "[" and path:sub(at):match("^%[%d+%]") then return true end
+            at = at + 1
+        end
+    end
+    return false
+end
+
+local function dedupeLimit()
+    return math.floor((tonumber(Config.MaxDedupeMB) or 8) * 1024 * 1024)
+end
+
+local function rememberScript(ctx, key, path)
+    if not key or ctx.seenScripts[key] then return end
+    local bytes = #key + #path
+    if ctx.dedupeBytes + bytes <= dedupeLimit() then
+        ctx.seenScripts[key] = path
+        ctx.dedupeBytes = ctx.dedupeBytes + bytes
+    else
+        ctx.stats.dedupeLimited = ctx.stats.dedupeLimited + 1
+    end
+end
+
 local function decompileOne(ctx, item)
     local stats, out = ctx.stats, ctx.out.Scripts
     local row = { path = item.path, className = item.className }
@@ -1091,7 +1350,16 @@ local function decompileOne(ctx, item)
         row.status = "server"
         return
     end
-    if ctx.suspects[item.path] then
+    local hashKey
+    if Has.scripthash then
+        local okHash, hash = pcall(Host.getscripthash, item.inst)
+        if okHash and typeof(hash) == "string" and #hash > 0 and #hash <= 1024 then hashKey = "hash:" .. hash end
+    end
+    local journalKey = hashKey
+    if not journalKey and not unstablePath(item.path) then journalKey = item.path end
+    row.crashIdentity = journalKey
+    if not journalKey then stats.unstableIdentities = stats.unstableIdentities + 1 end
+    if journalKey and ctx.suspects[journalKey] then
         stats.suspects = stats.suspects + 1
         row.status = "crash-skipped"
         return
@@ -1099,18 +1367,15 @@ local function decompileOne(ctx, item)
 
     local key
     if Config.DedupeScripts then
-        if Has.scripthash then
-            local ok, hash = pcall(getscripthash, item.inst)
-            if ok and typeof(hash) == "string" and hash ~= "" then key = "hash:" .. hash end
-        end
+        key = hashKey
         if not key and Has.bytecode then
-            local ok, bytecode = pcall(getscriptbytecode, item.inst)
-            if ok and typeof(bytecode) == "string" then
-                if bytecode == "" then
-                    row.status = "empty"
-                    return
+            local ok, bytecode = pcall(Host.getscriptbytecode, item.inst)
+            if ok and typeof(bytecode) == "string" and #bytecode > 0 then
+                if #bytecode <= Config.MaxScriptChars and #bytecode + 9 <= dedupeLimit() then
+                    key = "bytecode:" .. bytecode
+                else
+                    stats.dedupeLimited = stats.dedupeLimited + 1
                 end
-                key = "bytecode:" .. bytecode
             end
         end
         if key and ctx.seenScripts[key] then
@@ -1122,13 +1387,16 @@ local function decompileOne(ctx, item)
 
     local ok, source, took = false, "no decompiler on this executor", 0
     if Has.decompile then
-        State.record("ATTEMPT", item.path)
+        if journalKey and not ctx.journalDisabled then State.record("ATTEMPT", journalKey) end
         local started = os.clock()
         local settled
         ok, source, settled = decompileWithTimeout(item.inst)
         took = os.clock() - started
-        if settled then State.record("DONE", item.path)
-        else ctx.suspects[item.path] = true end
+        if journalKey then
+            if settled then
+                if not ctx.journalDisabled then State.record("DONE", journalKey) end
+            else ctx.suspects[journalKey] = true end
+        end
     end
 
     if not ok or typeof(source) ~= "string" then
@@ -1146,7 +1414,7 @@ local function decompileOne(ctx, item)
             return
         end
         if constants then
-            if key then ctx.seenScripts[key] = item.path end
+            if Config.DedupeScripts then rememberScript(ctx, key, item.path) end
             out:line("")
             out:line(THIN)
             row.line = out.lines + 1
@@ -1154,7 +1422,13 @@ local function decompileOne(ctx, item)
             out:line("-- " .. item.path)
             out:line(("-- %d string constants"):format(#constants))
             out:line(THIN)
-            for _, text in ipairs(constants) do out:line("--   " .. serialize(text)) end
+            local exportParts = Config.ExportScripts and {} or nil
+            for _, text in ipairs(constants) do
+                local line = "--   " .. serialize(text)
+                out:line(line)
+                if exportParts then exportParts[#exportParts + 1] = line end
+            end
+            if exportParts then row.exportSource = table.concat(exportParts, "\n") .. "\n" end
             row.lines, row.kb = #constants, 0
             row.status, row.note = "constants", why
             stats.constants = stats.constants + 1
@@ -1166,21 +1440,25 @@ local function decompileOne(ctx, item)
     end
 
     if Config.DedupeScripts then
-        key = key or ("source:" .. source)
-        if ctx.seenScripts[key] then
+        if not key then
+            if #source <= Config.MaxScriptChars and #source + 7 <= dedupeLimit() then key = "source:" .. source
+            else stats.dedupeLimited = stats.dedupeLimited + 1 end
+        end
+        if key and ctx.seenScripts[key] then
             stats.duplicates = stats.duplicates + 1
             row.status, row.sameAs = "same", ctx.seenScripts[key]
             return
         end
-        ctx.seenScripts[key] = item.path
+        rememberScript(ctx, key, item.path)
     end
 
     local chars = #source
     if chars > Config.MaxScriptChars then
         row.truncated = true
         stats.truncated = stats.truncated + 1
-        source = source:sub(1, Config.MaxScriptChars) .. ("\n-- [...truncated, %d chars total]"):format(chars)
+        source = utf8Prefix(source, Config.MaxScriptChars) .. ("\n-- [...truncated, %d chars total]"):format(chars)
     end
+    if Config.ExportScripts then row.exportSource = source end
     if source:sub(-1) ~= "\n" then source = source .. "\n" end
     local _, lines = source:gsub("\n", "")
 
@@ -1221,6 +1499,10 @@ local EXECUTOR_FUNCTIONS = {
 }
 
 local function lookup(name)
+    if not name:find(".", 1, true) then
+        local fn = resolveHost(name)
+        if fn then return fn end
+    end
     local current = getfenv and getfenv(0) or _G
     for part in name:gmatch("[^%.]+") do
         local ok, value = pcall(function() return current[part] end)
@@ -1248,15 +1530,39 @@ local function writeExecutor(out)
     end
 end
 
+local function capabilityReport(): any
+    local report = { functions = {}, aliases = {}, executor = "unknown" }
+    local identify = Host.identifyexecutor
+    local ok, executorName, version = pcall(function() if identify then return identify() end; return nil end)
+    if ok and typeof(executorName) == "string" then report.executor = executorName end
+    if ok and typeof(version) == "string" then report.version = version end
+    for _, name in ipairs({ "identifyexecutor", "writefile", "appendfile", "readfile", "makefolder", "isfolder", "isfile",
+        "decompile", "getscripthash", "getscriptbytecode", "getscriptclosure", "getconstants",
+        "getprotos", "getnilinstances", "getloadedmodules", "getrunningscripts", "getconnections" }) do
+        local fn, resolved = resolveHost(name)
+        report.functions[name] = fn ~= nil
+        if fn and resolved ~= name then report.aliases[name] = resolved end
+    end
+    return report
+end
+
 local function writeInfo(ctx, out)
-    local identify = has(identifyexecutor) and identifyexecutor or has(getexecutorname) and getexecutorname
-    local okExec, executor = pcall(function() return identify and identify() end)
+    local identify = Host.identifyexecutor
+    local okExec, executor, executorVersion = pcall(function() if identify then return identify() end; return nil end)
+    if okExec and typeof(executor) == "string" then
+        ctx.executor = executor
+        ctx.executorVersion = typeof(executorVersion) == "string" and executorVersion or nil
+    end
     local s, t = ctx.stats, ctx.timings
 
     out:line(pad("game", 12) .. (ctx.gameName or "?") .. (ctx.creator and ("   by " .. ctx.creator) or ""))
     out:line(pad("place", 12) .. ("%d   (game %d, version %d)"):format(game.PlaceId, game.GameId, game.PlaceVersion))
     out:line(pad("server", 12) .. ("%s   players %d/%d"):format(game.JobId, #Players:GetPlayers(), Players.MaxPlayers))
-    out:line(pad("executor", 12) .. (okExec and tostring(executor or "?") or "?"))
+    out:line(pad("executor", 12) .. (okExec and tostring(executor or "?") or "?")
+        .. (ctx.executorVersion and ("  version " .. ctx.executorVersion) or ""))
+    local report = capabilityReport()
+    for name, alias in pairs(report.aliases) do out:line("    " .. name .. " resolved through " .. alias) end
+    out:line("    Function presence is reported here; capture results describe which operations succeeded.")
     out:line(pad("generated", 12) .. os.date("%Y-%m-%d %H:%M:%S"))
     out:line(pad("took", 12) .. ("%.1fs   walk %.1fs, hidden %.1fs, decompile %.1fs, spy %.1fs"):format(
         t.total or 0, t.walk or 0, t.hidden or 0, t.decompile or 0, t.spy or 0))
@@ -1282,7 +1588,7 @@ end
 
 local function listeners(signal)
     if not Has.connections then return nil end
-    local ok, list = pcall(getconnections, signal)
+    local ok, list = pcall(Host.getconnections, signal)
     if not ok or type(list) ~= "table" then return nil end
     local order, counts = {}, {}
     for _, connection in ipairs(list) do
@@ -1338,7 +1644,7 @@ local function writeRemotes(ctx, out)
                     for _, where in ipairs(list) do out:line("        heard by " .. where) end
                 end
             elseif className == "RemoteFunction" and Has.callbackvalue then
-                local ok, fn = pcall(getcallbackvalue, inst, "OnClientInvoke")
+                local ok, fn = pcall(Host.getcallbackvalue, inst, "OnClientInvoke")
                 if ok and type(fn) == "function" then out:line("        answered by " .. (whereIs(fn) or "?")) end
             end
         end
@@ -1474,7 +1780,7 @@ local function writeGlobals(out)
         out:line("needs getrenv, which this executor does not have")
         return
     end
-    local ok, renv = pcall(getrenv)
+    local ok, renv = pcall(Host.getrenv)
     if not ok or type(renv) ~= "table" then
         out:line("getrenv failed")
         return
@@ -1525,7 +1831,7 @@ local function writeModules(ctx, out)
         out:line("needs getloadedmodules, which this executor does not have")
         return
     end
-    local ok, list = pcall(getloadedmodules)
+    local ok, list = pcall(Host.getloadedmodules)
     if not ok or type(list) ~= "table" then
         out:line("getloadedmodules failed")
         return
@@ -1649,7 +1955,7 @@ local function writeTreeSummary(ctx, out)
     out:line("")
 end
 
-local function writeIndex(ctx, out, bodyAt, scriptsFile)
+local function writeIndex(ctx: any, out: any, bodyAt: number, scriptsFile: string?)
     local rows = ctx.index
     local written, other = {}, {}
     for _, row in ipairs(rows) do
@@ -1662,7 +1968,8 @@ local function writeIndex(ctx, out, bodyAt, scriptsFile)
     for _, row in ipairs(written) do
         out:line(padLeft(tostring(bodyAt + row.line - 1), 7) .. padLeft(tostring(row.lines), 7)
             .. padLeft(row.status == "constants" and "strs" or ("%.1f"):format(row.kb), 7) .. "   " .. pad(row.className, 14) .. row.path
-            .. ((row.truncated or row.status == "truncated") and "  [truncated]" or ""))
+            .. ((row.truncated or row.status == "truncated") and "  [truncated]" or "")
+            .. (row.exportFile and ("  [file: " .. row.exportFile .. "]") or ""))
     end
     if #other > 0 then
         out:line("")
@@ -1674,24 +1981,52 @@ local function writeIndex(ctx, out, bodyAt, scriptsFile)
                 or row.status == "crash-skipped" and "crashed a previous dump - forget crash skips to retry"
                 or row.status or "unknown"
             out:line("    " .. pad(row.className, 14) .. row.path)
-            out:line("    " .. string.rep(" ", 14) .. "-> " .. why)
+            out:line("    " .. string.rep(" ", 14) .. "-> " .. why
+                .. (row.exportFile and ("  [file: " .. row.exportFile .. "]") or ""))
         end
     end
 end
 
+local function writeAssets(ctx: any, out: any)
+    local entries = table.clone(ctx.assetOrder or {})
+    table.sort(entries, function(a, b) return a.key < b.key end)
+    out:line(("%d distinct asset references, %d uses"):format(#entries, ctx.stats.assetUses or 0))
+    out:line("References identify client-visible asset properties; this report does not download assets.")
+    for _, entry in ipairs(entries) do
+        out:line("")
+        out:line(("%s  (%d uses)"):format(entry.id and ("asset " .. entry.id) or entry.uri, entry.uses))
+        if entry.id then out:line("    URI: rbxassetid://" .. entry.id) end
+        for _, ref in ipairs(entry.references) do
+            out:line("    " .. ref.path .. "  [" .. ref.className .. "." .. ref.property .. "]")
+        end
+        if entry.uses > #entry.references then
+            out:line(("    ... +%d uses; reference sample limit"):format(entry.uses - #entry.references))
+        end
+        Budget.check()
+    end
+    if (ctx.stats.assetOverflow or 0) > 0 then
+        out:line(("%d asset property references omitted by configured count/URI limits"):format(ctx.stats.assetOverflow))
+    end
+end
+
 local function writeOutputs(ctx)
+    if ctx.buffersReleased then error("capture buffers already released; start a new dump", 0) end
     local sections = {}
     local metadata = {}
     local manifestPath = filePath("Manifest.txt")
     ctx.outputParts, ctx.manifestPath = metadata, manifestPath
+    ctx.scriptExports = {}
     local function writeManifest(status, primaryPath)
         local manifest = Buffer.new()
         manifest:line(VERSION .. " OUTPUT MANIFEST")
         manifest:line("status: " .. status)
         manifest:line("primary file: " .. (primaryPath or "pending"))
         manifest:line("place: " .. tostring(game.PlaceId) .. "   generated: " .. os.date("%Y-%m-%d %H:%M:%S"))
+        manifest:line("executor: " .. tostring(ctx.executor or "unknown")
+            .. (ctx.executorVersion and ("  version " .. ctx.executorVersion) or ""))
         if ctx.cancelled then manifest:line("stopped early: output contains only work completed before cancellation") end
         if ctx.error then manifest:line("run error: " .. tostring(ctx.error)) end
+        if ctx.journalDisabled then manifest:line("Persistent crash tracking disabled: the existing state file could not be checked/read safely.") end
         manifest:line("")
         manifest:line("COMPLETE means the run finished; script failures, truncation and configured filters still apply.")
         manifest:line("This is a snapshot of objects and code visible to this client at capture time.")
@@ -1706,6 +2041,13 @@ local function writeOutputs(ctx)
             .. " (their unvisited descendants are not counted)")
         manifest:line("Repeated sibling roots folded in tree presentation: " .. tostring(ctx.stats.collapsed or 0)
             .. " (their contents were still scanned within the configured depth)")
+        manifest:line(("Duplicate key/path bytes retained: %d; cache limit: %d; cache-limited candidates: %d"):format(
+            ctx.dedupeBytes or 0, math.floor(Config.MaxDedupeMB * 1024 * 1024), ctx.stats.dedupeLimited or 0))
+        manifest:line("Scripts without a stable cross-run crash identity: " .. tostring(ctx.stats.unstableIdentities or 0))
+        if Config.Assets then
+            manifest:line(("Assets inventoried: %d; references encountered: %d; references omitted at limit: %d"):format(
+                ctx.stats.assets or 0, ctx.stats.assetUses or 0, ctx.stats.assetOverflow or 0))
+        end
         manifest:line("")
         manifest:line("PARTS (line numbers are aggregate within each logical file)")
         manifest:line("For an ordinary part, local line = aggregate line - first line + 1.")
@@ -1732,6 +2074,21 @@ local function writeOutputs(ctx)
         manifest:line("")
         manifest:line("SCRIPT RESULTS")
         for _, key in ipairs(keys) do manifest:line(key .. ": " .. tostring(statuses[key])) end
+        if Config.ExportScripts then
+            manifest:line("")
+            manifest:line("SCRIPT FILES")
+            manifest:line("Source files preserve collected text, including names; HideName redacts reports only.")
+            manifest:line("The script capture byte limit applies; source files are not split by the report file limit.")
+            manifest:line("Constants-only captures use .constants.txt; identical scripts share the original file.")
+            manifest:line("Files written: " .. tostring(#ctx.scriptExports))
+            for _, row in ipairs(ctx.index) do
+                if row.exportFile then
+                    manifest:line(("%s | bytes=%d | status=%s | truncated=%s | script=%s%s"):format(
+                        row.exportFile, row.exportBytes, row.status, tostring(row.truncated == true or row.status == "truncated"), row.path,
+                        row.sameAs and (" | same-as=" .. row.sameAs) or ""))
+                end
+            end
+        end
         writeAll(manifestPath, { anonymise(manifest:text()) })
     end
     local function save(path, chunks)
@@ -1759,6 +2116,7 @@ local function writeOutputs(ctx)
     add("Remotes", "REMOTES (and who listens)", function(out) writeRemotes(ctx, out) end, #ctx.remotes)
     add("Signals", "SIGNALS (who listens to input, the frame loop and you)", function(out) writeSignals(out) end)
     add("Tags", "TAGS", function(out) writeTags(out) end)
+    add("Assets", "ASSETS (meshes, images, audio and animations)", function(out) writeAssets(ctx, out) end, ctx.stats.assets or 0)
     add("Globals", "GLOBALS (the game's _G and shared)", function(out) writeGlobals(out) end)
     if ctx.modules then
         sections[#sections + 1] = { key = "Modules", title = "MODULES (what each loaded module returns)", out = ctx.modules }
@@ -1801,6 +2159,11 @@ local function writeOutputs(ctx)
     end
     local gameName = ctx.gameName or "?"
     writeManifest("WRITING")
+    local okExports, exportError = pcall(writeScriptExports, ctx, Budget.check)
+    if not okExports then
+        pcall(writeManifest, "WRITING")
+        error(exportError, 0)
+    end
 
     if Config.Output == "Split files" then
         local contents = Buffer.new()
@@ -1881,6 +2244,15 @@ local Session = {
 }
 env.__DumperSession = Session
 
+local function releaseCaptureBuffers(ctx: any)
+    for _, buffer in pairs(ctx.out or {}) do buffer.parts, buffer.n = {}, 0 end
+    if ctx.modules then ctx.modules.parts, ctx.modules.n = {}, 0 end
+    ctx.queue, ctx.stack, ctx.seenScripts = {}, {}, {}
+    ctx.visited = setmetatable({}, { __mode = "k" })
+    ctx.stats.dedupeBytesAtSave = ctx.dedupeBytes or 0
+    ctx.dedupeBytes, ctx.buffersReleased = 0, true
+end
+
 function Dump.run(ui)
     ui = typeof(ui) == "table" and ui or {}
     local function phase(name, fraction, detail)
@@ -1906,6 +2278,8 @@ function Dump.run(ui)
         ensureFolder()
         ctx = newContext()
         stats = ctx.stats
+        local capabilities = capabilityReport()
+        ctx.executor, ctx.executorVersion = capabilities.executor, capabilities.version
         Dump.ctx = ctx
         ctx.infoWorker = task.spawn(function()
             local okInfo, info = pcall(function()
@@ -1921,8 +2295,16 @@ function Dump.run(ui)
             end
         end)
         statePath = filePath("State.txt")
-        ctx.suspects = loadSuspects(statePath)
-        State.open(statePath, ctx.suspects)
+        local stateStatus = {}
+        local suspects = loadSuspects(statePath, stateStatus)
+        ctx.suspects = suspects
+        ctx.journalDisabled = stateStatus.writable == false
+        if not ctx.journalDisabled then
+            State.open(statePath, ctx.suspects)
+            ctx.stateOpened = true
+        else
+            log("Persistent crash tracking unavailable; capturing without modifying the existing state file", "info")
+        end
         if Config.Spy then
             Spy.start()
             log(Spy.hooked and "remote spy recording, in and out" or "remote spy recording, incoming only")
@@ -2031,10 +2413,11 @@ function Dump.run(ui)
         phase("writing", 1, ctx.complete and "" or "saving partial dump")
         okWrite, output, manifest = pcall(writeOutputs, ctx)
         if ui.stats then pcall(ui.stats, ctx) end
-        if statePath and ctx.suspects then
+        if statePath and ctx.suspects and ctx.stateOpened then
             local okState, stateError = pcall(State.finish, ctx.suspects)
             if not okState then log("crash state could not be saved: " .. tostring(stateError), "bad") end
         end
+        if okWrite then releaseCaptureBuffers(ctx) end
     end
 
     local summary = stats and ("%d instances - %d scripts (+%d same) - %d remotes - %d values - %.1fs"):format(
@@ -2042,7 +2425,7 @@ function Dump.run(ui)
     local success = ok and okWrite
     local message = not ok and ("errored: " .. tostring(err))
         or not okWrite and ("writing failed: " .. tostring(output))
-        or (Dump.cancel and "stopped early, saved what it had" or "done")
+        or (ctx and ctx.cancelled and "stopped early, saved what it had" or "done")
     Dump.lastOutput = okWrite and output or nil
     Dump.lastResult = {
         success = success, complete = ctx and ctx.complete and okWrite or false,
@@ -2068,6 +2451,7 @@ env.Dumper = {
     ForgetCrashes = forgetCrashes,
     IsRunning = Session.busy,
     LastResult = function() return Dump.lastResult end,
+    Capabilities = capabilityReport,
 }
 
 local function startHeadless()
@@ -2165,7 +2549,7 @@ do
         Text = 'Copy file path',
         Func = function()
             if Dump.lastOutput and Has.clipboard then
-                pcall(setclipboard, Dump.lastOutput)
+                pcall(Host.setclipboard, Dump.lastOutput)
                 Library:Notify({ Title = 'Dumper', Description = 'path copied', Time = 3 })
             end
         end,
@@ -2189,6 +2573,7 @@ do
     toggle(what, 'Listeners', 'Who listens to each remote', 'the script and line connected to each remote (needs getconnections)')
     toggle(what, 'Signals', 'Input + frame loop listeners', 'which scripts listen to input, RenderStepped / Heartbeat and your character')
     toggle(what, 'Tags', 'Tags', 'every CollectionService tag, also shown in the tree')
+    toggle(what, 'Assets', 'Asset inventory', 'mesh, texture, image, audio and animation references with their locations')
     toggle(what, 'Globals', 'The game\'s _G and shared')
     toggle(what, 'Modules', 'Module APIs (careful)', 'what each loaded module returns: its functions and fields. require on a module only loaded in another VM (an actor) runs it again here, which can double up what it does')
     toggle(what, 'Values', 'Values + attributes')
@@ -2215,6 +2600,7 @@ do
         Callback = function(value) UserConfig.Output = value or UserConfig.Output end,
     })
     toggle(out, 'HideName', 'Hide my name in the file', 'your username is written as <you>, so a dump can be shared')
+    toggle(out, 'ExportScripts', 'Save individual script files', 'adds source files and manifest links. Source files retain collected text; username redaction applies to reports.')
     out:AddSlider('dumper_maxfile', {
         Text = 'Max file size',
         Min = 0, Max = 95, Default = UserConfig.MaxFileMB, Rounding = 0, Suffix = ' MB',
@@ -2258,6 +2644,14 @@ do
     })
 
     local limits = Tab:AddRightGroupbox('Limits', 'ruler')
+    limits:AddSlider('dumper_dedupe_memory', {
+        Text = 'Duplicate cache limit', Min = 0, Max = 64, Default = UserConfig.MaxDedupeMB, Rounding = 0, Suffix = ' MB',
+        Callback = function(value) UserConfig.MaxDedupeMB = tonumber(value) or UserConfig.MaxDedupeMB end,
+    })
+    limits:AddSlider('dumper_assets_limit', {
+        Text = 'Unique asset limit', Min = 100, Max = 30000, Default = UserConfig.MaxAssets, Rounding = 0,
+        Callback = function(value) UserConfig.MaxAssets = tonumber(value) or UserConfig.MaxAssets end,
+    })
     limits:AddSlider('dumper_depth', {
         Text = 'Max tree depth', Min = 4, Max = 60, Default = UserConfig.MaxDepth, Rounding = 0,
         Callback = function(value) UserConfig.MaxDepth = tonumber(value) or UserConfig.MaxDepth end,
