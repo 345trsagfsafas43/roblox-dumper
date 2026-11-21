@@ -71,7 +71,7 @@ local Has = {
     clipboard = has(Host.setclipboard),
 }
 
-local VERSION = "Dumper v9"
+local VERSION = "Dumper v9.1"
 local WIDTH = 80
 local RULE = string.rep("=", WIDTH)
 local THIN = string.rep("-", WIDTH)
@@ -2653,15 +2653,15 @@ do
         Callback = function(value) UserConfig.MaxAssets = tonumber(value) or UserConfig.MaxAssets end,
     })
     limits:AddSlider('dumper_depth', {
-        Text = 'Max tree depth', Min = 4, Max = 60, Default = UserConfig.MaxDepth, Rounding = 0,
+        Text = 'Max tree depth', Min = 4, Max = 200, Default = UserConfig.MaxDepth, Rounding = 0,
         Callback = function(value) UserConfig.MaxDepth = tonumber(value) or UserConfig.MaxDepth end,
     })
     limits:AddSlider('dumper_chars', {
-        Text = 'Max KB per script', Min = 10, Max = 1000, Default = math.floor(UserConfig.MaxScriptChars / 1000), Rounding = 0, Suffix = ' KB',
+        Text = 'Max KB per script', Min = 10, Max = 10000, Default = math.floor(UserConfig.MaxScriptChars / 1000), Rounding = 0, Suffix = ' KB',
         Callback = function(value) UserConfig.MaxScriptChars = (tonumber(value) or 500) * 1000 end,
     })
     limits:AddSlider('dumper_timeout', {
-        Text = 'Decompile timeout', Min = 2, Max = 60, Default = UserConfig.DecompileTimeout, Rounding = 0, Suffix = 's',
+        Text = 'Decompile timeout', Min = 2, Max = 120, Default = UserConfig.DecompileTimeout, Rounding = 0, Suffix = 's',
         Callback = function(value) UserConfig.DecompileTimeout = tonumber(value) or UserConfig.DecompileTimeout end,
     })
 

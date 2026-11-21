@@ -1,5 +1,11 @@
 # Changes
 
+## v9.1
+
+Expanded UI slider ranges to match the supported high limits: tree depth 200, script size 10000 KB and decompile timeout 120 seconds. Users can keep the menu while setting these limits. Max speed remains available and uses the same underlying decompiler.
+
+Verification: the 80 existing actual-source regressions and Luau 0.748 analysis/compilation passed. Rendered UI and live Potassium remain unverified.
+
 ## v9
 
 Added bounded asset inventory and optional individual script files with manifest/index references. Source exports preserve the collected text, including its newline shape; constants-only exports use a distinct extension. Redaction remains report-only for source exports.

@@ -1,14 +1,16 @@
-# Roblox Dumper v9
+# Roblox Dumper v9.1
 
 A Roblox client dumper with asset inventory, optional individual source files, and guarded capture/output handling.
 
 ## Run
 
 ```lua
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v9/dumper.lua'))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v9.1/dumper.lua'))()
 ```
 
 RightShift toggles the menu. Choose the capture options, then press **Start dump**.
+
+Keep `NoUI=false` and `AutoStart=false` to choose when to capture. UI sliders support a depth of 200, 10000 KB per script and a 120-second decompile timeout. `Max` speed allocates more work time between yields; it can make gameplay choppy and does not change decompiler reconstruction quality.
 
 For richer output with separate source files:
 
@@ -20,7 +22,7 @@ getgenv().DumperConfig = {
     Speed = "Smooth",
     MaxScriptChars = 1000000,
 }
-loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v9/dumper.lua'))()
+loadstring(game:HttpGet('https://raw.githubusercontent.com/345trsagfsafas43/roblox-dumper/v9.1/dumper.lua'))()
 ```
 
 Add `AutoStart = true, NoUI = true` for a headless capture.
