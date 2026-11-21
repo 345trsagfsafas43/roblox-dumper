@@ -147,7 +147,7 @@ local function normaliseConfig(input)
 end
 
 Config = normaliseConfig(Config)
-local UserConfig = Config -- UI/API changes apply to the next run, not the current snapshot.
+local UserConfig = Config
 
 local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true }
 local REMOTE_CLASSES = {
@@ -488,7 +488,7 @@ local function writeChunks(path: string, chunks: {string})
                 cursor = #chunk + 1
             else
                 local cut = chunk:sub(cursor, cursor + room - 1):match("^.*()\n")
-                if not cut and size > 0 then flush() -- no line break fits: start a fresh part
+                if not cut and size > 0 then flush()
                 else
                     if not cut then
                         cut = room
@@ -836,12 +836,12 @@ local function newContext()
         classCount = {},
         visited = setmetatable({}, { __mode = "k" }),
         stack = {},
-        queue = {},        -- scripts found by the walk, decompiled afterwards
-        remotes = {},      -- { inst, parent, name, className }
+        queue = {},
+        remotes = {},
         interactables = {},
-        texts = {},        -- ui text rows
+        texts = {},
         hidden = {},
-        index = {},        -- the script index rows
+        index = {},
         seenScripts = {},
         out = {
             Tree = Buffer.new(),
@@ -1186,7 +1186,7 @@ local function decompileOne(ctx, item)
 
     out:line("")
     out:line(THIN)
-    row.line = out.lines + 1   -- this header's line, counted within the section
+    row.line = out.lines + 1
     out:line(("-- [%s] %s%s"):format(item.className, item.inst.Name, item.hidden and "  (hidden)" or ""))
     out:line("-- " .. item.path)
     out:line(("-- %d lines, %.1f KB, decompiled in %.2fs"):format(lines, chars / 1024, took))
